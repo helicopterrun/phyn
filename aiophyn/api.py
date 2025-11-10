@@ -1,0 +1,286 @@
+"""Define a base client for interacting with Phyn."""
+
+import asyncio
+import logging
+from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime, timedelta
+from typing import Optional
+
+import boto3
+from aiohttp import ClientSession, ClientTimeout
+from aiohttp.client_exceptions import ClientError
+from pycognito.aws_srp import AWSSRP
+
+from .partners import KOHLER_API
+from .mqtt import MQTTClient
+from .device import Device
+from .errors import BrandError, RequestError
+from .home import Home
+
+
+_LOGGER = logging.getLogger(__name__)
+
+BRANDS = {
+    "phyn": 0,
+    "kohler": 1,
+}
+
+DEFAULT_HEADER_CONTENT_TYPE: str = "application/json"
+DEFAULT_HEADER_USER_AGENT: str = "phyn/18 CFNetwork/1331.0.7 Darwin/21.4.0"
+DEFAULT_HEADER_CONNECTION: str = "keep-alive"
+DEFAULT_HEADER_API_KEY: list[str] = [
+    "E7nfOgW6VI64fYpifiZSr6Me5w1Upe155zbu4lq8",
+    "OOLFiYu7Ts5RKI4BV6WeI3zb38HU76vZ8x5lFX6Y",
+]
+DEFAULT_HEADER_ACCEPT: str = "application/json"
+DEFAULT_HEADER_ACCEPT_ENCODING: str = "gzip, deflate, br"
+
+COGNITO_REGION: str = "us-east-1"
+COGNITO_POOL_ID: str = "us-east-1_UAv6IUsyh"
+COGNITO_CLIENT_ID: str = "5q2m8ti0urmepg4lup8q0ptldq"
+
+DEFAULT_TIMEOUT: int = 10
+
+
+class API:
+    """Define the API object."""
+
+    def __init__(
+        self,
+        username: str,
+        password: str,
+        *,
+        phyn_brand: str,
+        session: Optional[ClientSession] = None,
+        client_id: Optional[str] = None,
+        verify_ssl: bool = True,
+        proxy: Optional[str] = None,
+        proxy_port: Optional[int] = None,
+    ) -> None:
+        """Initialize."""
+        if phyn_brand not in BRANDS:
+            raise BrandError("Invalid phyn brand")
+
+        self._brand: str = BRANDS[phyn_brand]
+
+        self._username: str = username
+        if self._brand != BRANDS["phyn"]:
+            self._password: str = None
+            self._partner_api = None
+            self._partner_password: str = password
+            self._cognito: dict[str] = None
+        else:
+            self._password: str = password
+            self._cognito: dict[str] = {
+                "app_client_id": COGNITO_CLIENT_ID,
+                "pool_id": COGNITO_POOL_ID,
+                "region": COGNITO_REGION,
+            }
+
+        self._session: ClientSession = session
+        self._iot_id = None
+        self._iot_credentials = None
+        self.mqtt = None
+        self._id_token = None
+        self._refresh_token = None
+        self._mqtt_settings = {}
+
+        self.verify_ssl = verify_ssl
+        self.proxy = proxy
+        self.proxy_port = proxy_port
+        self.proxy_url: Optional[str] = None
+        if self.proxy is not None and self.proxy_port is not None:
+            self.proxy_url = f"https://{proxy}:{proxy_port}"
+
+        self._token: Optional[str] = None
+        self._token_expiration: Optional[datetime] = None
+        self._auth_lock: asyncio.Lock = asyncio.Lock()
+
+        self.home: Home = Home(self._request)
+        self.device: Device = Device(self._request)
+        self.mqtt = MQTTClient(
+            self,
+            client_id=client_id,
+            verify_ssl=verify_ssl,
+            proxy=proxy,
+            proxy_port=proxy_port,
+        )
+
+    @property
+    def username(self) -> Optional[str]:
+        """Get the API username"""
+        return self._username
+
+    async def _request(
+        self, method: str, url: str, token_type: str = "access", **kwargs
+    ) -> dict:
+        """Make a request against the API.
+
+        :param method: GET or POST request
+        :type method: str
+        :param url: API URL
+        :type url: str
+        :param token_type: ID or Access token, defaults to "access"
+        :type token_type: str, optional
+        :raises RequestError: Error if issue accessing URL
+        :return: JSON response
+        :rtype: dict
+        """
+        if self._token_expiration and datetime.now() >= self._token_expiration:
+            async with self._auth_lock:
+                # Double-check after acquiring lock to avoid duplicate authentication
+                if self._token_expiration and datetime.now() >= self._token_expiration:
+                    _LOGGER.info("Requesting new access token to replace expired one")
+
+                    # Nullify the token so that the authentication request doesn't use it:
+                    self._token = None
+
+                    # Nullify the expiration so the authentication request doesn't get caught
+                    # here:
+                    self._token_expiration = None
+
+                    await self.async_authenticate()
+
+        kwargs.setdefault("headers", {})
+        kwargs["headers"].update(
+            {
+                "Content-Type": DEFAULT_HEADER_CONTENT_TYPE,
+                "User-Agent": DEFAULT_HEADER_USER_AGENT,
+                "Connection": DEFAULT_HEADER_CONNECTION,
+                "x-api-key": DEFAULT_HEADER_API_KEY[self._brand],
+                "Accept": DEFAULT_HEADER_ACCEPT,
+                "Accept-Encoding": DEFAULT_HEADER_ACCEPT_ENCODING,
+            }
+        )
+
+        if token_type == "access":
+            if self._token:
+                kwargs["headers"]["Authorization"] = self._token
+        elif token_type == "id":
+            if self._id_token:
+                kwargs["headers"]["Authorization"] = self._id_token
+
+        if self.proxy_url is not None:
+            kwargs["proxy"] = self.proxy_url
+
+        if not self.verify_ssl:
+            kwargs["ssl"] = False
+
+        use_running_session = self._session and not self._session.closed
+
+        if use_running_session:
+            session = self._session
+        else:
+            session = ClientSession(timeout=ClientTimeout(total=DEFAULT_TIMEOUT))
+
+        try:
+            async with session.request(method, url, **kwargs) as resp:
+                data: dict = await resp.json(content_type=None)
+                resp.raise_for_status()
+                return data
+        except ClientError as err:
+            raise RequestError(f"There was an error while requesting {url}") from err
+        finally:
+            if not use_running_session:
+                await session.close()
+
+    async def async_authenticate(self) -> None:
+        """Authenticate the user and set the access token with its expiration."""
+        async with self._auth_lock:
+            if self._brand == BRANDS["kohler"]:
+                if self._password is None:
+                    _LOGGER.info("Auhenticating to Kohler")
+                    self._partner_api = KOHLER_API(
+                        self._username,
+                        self._partner_password,
+                        verify_ssl=self.verify_ssl,
+                        proxy=self.proxy,
+                        proxy_port=self.proxy_port,
+                    )
+                    await self._partner_api.authenticate()
+                    self._password = self._partner_api.get_phyn_password()
+                    self._cognito = self._partner_api.get_cognito_info()
+                    self._mqtt_settings = self._partner_api.get_mqtt_info()
+
+            # Create a copy of cognito info to pass to thread to avoid shared mutable state
+            cognito_info = self._cognito.copy()
+            username = self._username
+            password = self._password
+
+            executor = ThreadPoolExecutor(max_workers=1)
+            try:
+                future = executor.submit(
+                    self._authenticate, cognito_info, username, password
+                )
+                auth_response = await asyncio.wrap_future(future)
+            finally:
+                executor.shutdown(wait=True)
+
+            access_token = auth_response["AuthenticationResult"]["AccessToken"]
+            expires_in = auth_response["AuthenticationResult"]["ExpiresIn"]
+            id_token = auth_response["AuthenticationResult"]["IdToken"]
+            refresh_token = auth_response["AuthenticationResult"]["RefreshToken"]
+
+            self._token = access_token
+            self._token_expiration = datetime.now() + timedelta(seconds=expires_in)
+            self._id_token = id_token
+            self._refresh_token = refresh_token
+
+    def _authenticate(self, cognito_info, username, password):
+        """boto3 is synchronous, so authenticate in a separate thread."""
+        _LOGGER.info("Requesting token from AWS")
+        client = boto3.client("cognito-idp", region_name=cognito_info["region"])
+        aws = AWSSRP(
+            username=username,
+            password=password,
+            pool_id=cognito_info["pool_id"],
+            client_id=cognito_info["app_client_id"],
+            client=client,
+        )
+        auth_response = aws.authenticate_user()
+        return auth_response
+
+
+async def async_get_api(
+    username: str,
+    password: str,
+    *,
+    phyn_brand: str = "phyn",
+    session: Optional[ClientSession] = None,
+    client_id: Optional[str] = None,
+    verify_ssl: bool = True,
+    proxy: Optional[str] = None,
+    proxy_port: Optional[int] = None,
+) -> API:
+    """Instantiate an authenticated API object.
+
+    :param session: An ``aiohttp`` ``ClientSession``
+    :type session: ``aiohttp.client.ClientSession``
+    :param email: A Phyn email address
+    :type email: ``str``
+    :param password: A Phyn password
+    :type password: ``str``
+    :param phyn_brand: A brand for phyn
+    :type phyn_brand: ``str``
+    :param client_id: A MQTT client id name
+    :type client_id: ``str``
+    :param verify_ssl: Should SSL certificates be verified
+    :type verify_ssl: ``bool``
+    :param proxy: HTTP proxy hostname/IP
+    :type proxy: ``str``
+    :param proxy_port: Port for HTTP proxy
+    :type proxy_port: ``int``
+    :rtype: :meth:`aiophyn.api.API`
+    """
+    api = API(
+        username,
+        password,
+        phyn_brand=phyn_brand,
+        session=session,
+        client_id=client_id,
+        verify_ssl=verify_ssl,
+        proxy=proxy,
+        proxy_port=proxy_port,
+    )
+    await api.async_authenticate()
+    return api
